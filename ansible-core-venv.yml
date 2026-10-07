@@ -1,0 +1,105 @@
+---
+# Installiert ansible-core parallel zum RHEL-RPM (2.14) in einem venv mit
+# Python 3.14 aus AppStream und verlinkt die Befehle nach /usr/local/bin.
+# Idempotent: kann beliebig oft laufen und ergänzt nur, was fehlt.
+#
+# Voraussetzungen: RHEL 9.8+, sudo-Rechte, Zugriff auf PyPI (direkt, Proxy oder Mirror)
+#
+# Probelauf:    ansible-playbook -i inventory.ini ansible-core-venv.yml --check --diff
+# Installation: ansible-playbook -i inventory.ini ansible-core-venv.yml
+# Patch-Update: ansible-playbook -i inventory.ini ansible-core-venv.yml -e controller_core_state=latest
+
+- name: ansible-core im venv bereitstellen
+  hosts: ansible_controller
+  become: true
+
+  vars:
+    controller_python_version: "3.14"    # ab RHEL 9.4 ginge auch "3.12" (Support nur bis April 2027)
+    controller_core_version: "2.21"      # "2.21" = neuester Patch-Stand, "2.21.3" = genau diese Version
+    controller_core_state: present       # latest = auf den neuesten Patch-Stand aktualisieren
+    controller_venv_path: /opt/ansible
+    controller_link_dir: /usr/local/bin
+    controller_extra_packages: []        # Python-Bibliotheken für Plugins, z. B. [jmespath, netaddr]
+    controller_pip_extra_args: ""        # z. B. "--proxy http://proxy:3128" oder "--index-url https://mirror/simple"
+
+    controller_python: "/usr/bin/python{{ controller_python_version }}"
+    # Module immer mit dem System-Python 3.9 ausführen, nie mit einem
+    # eventuell selbst kompilierten Python aus /usr/local/bin
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Zielsystem prüfen
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == 'RedHat'
+          - ansible_facts['distribution_major_version'] | int >= 9
+        fail_msg: "Dieses Playbook ist für RHEL 9 und neuer gedacht."
+
+    - name: Python {{ controller_python_version }} installieren
+      ansible.builtin.dnf:
+        name:
+          - "python{{ controller_python_version }}"
+          - python3-packaging            # braucht das pip-Modul unter /usr/bin/python3
+        state: present
+
+    - name: venv anlegen und ansible-core {{ controller_core_version }} installieren
+      ansible.builtin.pip:
+        name: "ansible-core=={{ controller_core_version }}.*"
+        state: "{{ controller_core_state }}"
+        virtualenv: "{{ controller_venv_path }}"
+        virtualenv_command: "{{ controller_python }} -m venv"
+        extra_args: "{{ controller_pip_extra_args | default(omit, true) }}"
+        umask: "0022"                    # Dateien für alle lesbar, auch bei strenger System-umask
+
+    - name: Zusätzliche Python-Pakete ins venv installieren
+      ansible.builtin.pip:
+        name: "{{ controller_extra_packages }}"
+        virtualenv: "{{ controller_venv_path }}"
+        virtualenv_command: "{{ controller_python }} -m venv"
+        extra_args: "{{ controller_pip_extra_args | default(omit, true) }}"
+        umask: "0022"
+      when: controller_extra_packages | length > 0
+
+    # Absicherung, falls später jemand von Hand mit strenger umask nachinstalliert
+    - name: venv für alle Benutzer lesbar machen
+      ansible.builtin.file:
+        path: "{{ controller_venv_path }}"
+        state: directory
+        mode: "a+rX"
+        recurse: true
+        follow: false
+
+    - name: Ansible-Befehle im venv ermitteln
+      ansible.builtin.find:
+        paths: "{{ controller_venv_path }}/bin"
+        patterns: "ansible*"
+        file_type: file
+      register: controller_bins
+
+    - name: Befehle nach {{ controller_link_dir }} verlinken
+      ansible.builtin.file:
+        src: "{{ item.path }}"
+        dest: "{{ controller_link_dir }}/{{ item.path | basename }}"
+        state: link
+      loop: "{{ controller_bins.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    # Läuft bewusst ohne sudo und prüft damit auch die Rechte für normale Benutzer
+    - name: Installierte Version abfragen
+      ansible.builtin.command:
+        argv:
+          - "{{ controller_link_dir }}/ansible"
+          - --version
+      become: false
+      register: controller_version_check
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Version prüfen
+      ansible.builtin.assert:
+        that:
+          - '("core " ~ controller_core_version) in controller_version_check.stdout'
+        success_msg: "{{ controller_version_check.stdout_lines[0] }}"
+        fail_msg: "Erwartet war ansible-core {{ controller_core_version }}."
+      when: not ansible_check_mode
